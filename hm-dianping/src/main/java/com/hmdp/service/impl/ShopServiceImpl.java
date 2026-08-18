@@ -40,12 +40,39 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
     @Resource
     private CacheClient cacheClient;
+
+    // ==================== 店铺缓存版本说明 ====================
+    // V1：直接查询数据库，没有使用Redis缓存
+    // V2：使用缓存空值解决缓存穿透问题 queryWithPassThrough()
+    // V3：使用互斥锁解决缓存击穿问题 queryWithMutex()
+    // V4：使用逻辑过期解决缓存击穿问题 queryWithLogicalExpire()
+    // V5：把缓存穿透逻辑封装到CacheClient工具类
+    // V6：把逻辑过期逻辑封装到CacheClient工具类【当前使用】
+    // 整理时间：2026-08-18，只整理顺序和版本标记，保留原来的代码和注释
+    // =========================================================
+
     @Override
     public Result queryById(Long id) {
+        // ==================== V1 直接查询数据库（已停用） ====================
+        // 停用原因：每次请求都查询数据库，并发高时数据库压力大
+//        Shop shop = getById(id);
+
+        // ==================== V2 缓存穿透解决（已停用） ====================
+        // 优化：数据库不存在的数据也缓存空值，避免请求一直打到数据库
+        // 停用原因：还没有解决热点key失效时的缓存击穿问题
 //        Shop shop = queryWithPassThrough(id);//缓存穿透解决
+
+        // ==================== V3 互斥锁解决缓存击穿（已停用） ====================
+        // 优化：只允许一个线程查询数据库并重建缓存
+        // 停用原因：其他线程需要等待，性能会受到影响
 //        Shop shop = queryWithMutex(id);//缓存击穿解决
+
+        // ==================== V4 逻辑过期解决缓存击穿（已停用） ====================
+        // 优化：过期时先返回旧数据，再开启新线程重建缓存
+        // 停用原因：这部分通用代码比较多，后面封装到了CacheClient中
 //        Shop shop = queryWithLogicalExpire(id);//逻辑过期解决缓存击穿问题
 
+        // ==================== V5 CacheClient缓存穿透版（已停用） ====================
 //        工具类中封装的缓存逻辑来解决缓存穿透问题
 //        Shop shop = cacheClient.queryWithPassThrough(
 //                RedisConstants.CACHE_SHOP_KEY
@@ -54,6 +81,10 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 //                , this::getById
 //                , RedisConstants.CACHE_SHOP_TTL
 //                , TimeUnit.MINUTES);
+
+        // ==================== V6 CacheClient逻辑过期版（当前使用） ====================
+        // 优化：业务层只负责传参数，逻辑过期、加锁和缓存重建由CacheClient完成
+        // 注意：逻辑过期方案需要先使用saveShop2Redis()把店铺数据预热到Redis
         //工具类中封装的缓存逻辑来解决缓存击穿问题
         Shop shop = cacheClient.queryWithLogicalExpire(
                 RedisConstants.CACHE_SHOP_KEY
@@ -70,6 +101,9 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         return Result.ok(shop);
     }
 
+    // ==================== V2 缓存穿透版（已停用） ====================
+    // 升级了什么：给不存在的店铺缓存空值，解决缓存穿透
+    // 为什么停用：没有解决缓存击穿，后面升级为V3互斥锁方案
 //queryWithPassThrough解决缓存穿透问题
     public Shop queryWithPassThrough(Long id) {
         String key = RedisConstants.CACHE_SHOP_KEY + id;
@@ -100,6 +134,9 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         return shop;
     }
 
+    // ==================== V3 互斥锁版（已停用） ====================
+    // 升级了什么：同一时间只让一个线程重建缓存，解决缓存击穿
+    // 为什么停用：没有拿到锁的线程要休眠重试，响应时间比较长，后面升级为V4逻辑过期
 //    解决缓存击穿问题
     public Shop queryWithMutex(Long id) {
         String key = RedisConstants.CACHE_SHOP_KEY + id;
@@ -119,8 +156,9 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 //            4.1获取互斥锁
         String lockKey = LOCK_SHOP_KEY  + id;
         Shop shop=null;
+        boolean isLock = false;
         try {
-            boolean isLock = tryLock(lockKey);
+            isLock = tryLock(lockKey);
 //            4.2判断是否获取成功
             if (!isLock) {
     //            4.3失败则休眠并重试
@@ -141,7 +179,10 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
             throw new RuntimeException(e);
         } finally {
 //            7.释放互斥锁
-            unLock(lockKey);
+            //【必要修正】只有当前线程拿到锁，才能释放锁，避免误删其他线程的锁
+            if (isLock) {
+                unLock(lockKey);
+            }
         }
 
 //        8.返回
@@ -162,6 +203,9 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         stringRedisTemplate.delete(key);
     }
 
+    // ==================== V4 手写逻辑过期版（已停用） ====================
+    // 升级了什么：缓存过期时先返回旧数据，再由独立线程重建缓存，减少用户等待
+    // 为什么停用：代码比较通用且较多，后面统一封装到了CacheClient工具类
 //    逻辑过期解决缓存击穿问题
     public void saveShop2Redis(Long id,Long expireSeconds) throws Exception {
 //        1.查询店铺数据
@@ -265,6 +309,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
 
 
+    // ==================== 店铺更新：数据库更新后删除缓存 ====================
     @Override
     @Transactional//添加事务
     public Result update(Shop shop) {
