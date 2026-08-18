@@ -1,5 +1,6 @@
 package com.hmdp.service.impl;
 
+import cn.hutool.core.bean.BeanUtil;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.SeckillVoucher;
 import com.hmdp.entity.VoucherOrder;
@@ -16,6 +17,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.aop.framework.AopContext;
 import org.springframework.core.io.ClassPathResource;
+import org.springframework.data.redis.connection.stream.*;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
@@ -24,8 +26,11 @@ import org.springframework.transaction.annotation.Transactional;
 
 import javax.annotation.PostConstruct;
 import javax.annotation.Resource;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.Collections;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
@@ -70,14 +75,17 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     // V2：使用synchronized解决单机环境的一人一单
     // V3：使用SimpleRedisLock解决集群环境的一人一单
     // V4：使用Redisson替代自己实现的分布式锁
-    // V5：使用Lua脚本判断秒杀资格，再放入阻塞队列异步下单【当前使用】
+    // V5：使用Lua脚本判断秒杀资格，再放入JVM阻塞队列异步下单（已停用）
+    // V6：使用Lua脚本判断资格并写入Redis Stream，消费者组异步下单【当前使用】
     // 整理时间：2026-08-18，只整理顺序和版本标记，尽量保留原来的代码和注释
     // ========================================================
 
-    // ==================== V5 阻塞队列和异步消费者（当前使用） ====================
-    //请求线程是生产者，把订单放入队列
-    //独立线程是消费者，从队列取出订单并保存到数据库
-    private final BlockingQueue<VoucherOrder> orderTasks = new ArrayBlockingQueue<>(1024 * 1024);
+    // ==================== V6 Redis Stream异步消费者（当前使用） ====================
+    // 升级了什么：用Redis Stream替代V5的JVM阻塞队列，消息可以跨服务重启保留
+    // 请求线程是生产者：Lua判断资格、预扣Redis库存并把订单消息写入stream.order
+    // 独立线程是消费者：从stream.order读取订单，再保存到数据库
+    // V6主流程：seckillVoucher -> seckill.lua写入Stream -> VoucherOrderHandler
+    //          -> handleVoucherOrder加锁 -> createVoucherOrder事务下单 -> XACK确认
 
     //创建单线程线程池
     private static final ExecutorService SECKILL_ORDER_EXECUTOR = Executors.newSingleThreadExecutor();
@@ -91,25 +99,79 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandler());
     }
 
-    //阻塞队列的消费者
+    //Redis Stream的消费者
     private class VoucherOrderHandler implements Runnable {
         @Override
         public void run() {
             while (true) {
+                String queueName = "stream.order";
                 try {
-                    //1.获取队列中的订单信息
-                    //队列中没有订单时，take()会阻塞等待，不会一直空转
-                    VoucherOrder voucherOrder = orderTasks.take();
-                    //2.创建订单
+                    //1.获取消息队列中的订单信息 XREADGROUP GROUP g1 c1 COUNT 1 BLOCK 2000 STREAMS stream.order >
+                    List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
+                            Consumer.from("g1", "c1"),
+                            StreamReadOptions.empty().count(1).block(Duration.ofSeconds(2)),
+                            StreamOffset.create(queueName, ReadOffset.lastConsumed())
+                    );
+//                    2.判断消息获取是否成功
+                    if (list == null || list.isEmpty()){
+//                        2.1如果失败说明没有消息，继续下一次循环
+                        continue;
+                    }
+                    MapRecord<String, Object, Object> record = list.get(0);
+                    Map<Object, Object> value = record.getValue();
+                    VoucherOrder voucherOrder = BeanUtil.fillBeanWithMap(value, new VoucherOrder(), true);
+//                    3.如果成功说明可以下单
                     handleVoucherOrder(voucherOrder);
+                    //4.ACK确认 XACK stream.order g1 id
+                    stringRedisTemplate.opsForStream().acknowledge(queueName, "g1", record.getId());
+
                 } catch (Exception e) {
                     //一个订单处理失败，不能让整个消费者线程停止
                     LOGGER.error("处理订单异常", e);
+                    //处理失败的消息会留在pending-list中，从pending-list重新读取
+                    handlePendingList();
+                }
+            }
+        }
+
+        //处理已经被读取，但是还没有ACK确认的消息
+        private void handlePendingList()  {
+            while (true) {
+                String queueName = "stream.order";
+                try {
+                    //1.获取pending-list的订单信息 XREADGROUP GROUP g1 c1 COUNT 1 STREAMS stream.order 0
+                    List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
+                            Consumer.from("g1", "c1"),
+                            StreamReadOptions.empty().count(1),
+                            StreamOffset.create(queueName, ReadOffset.from("0"))
+                    );
+//                    2.判断消息获取是否成功
+                    if (list == null || list.isEmpty()){
+//                        2.1如果没有pending消息，结束本次pending-list处理
+                        break;
+                    }
+                    MapRecord<String, Object, Object> record = list.get(0);
+                    Map<Object, Object> value = record.getValue();
+                    VoucherOrder voucherOrder = BeanUtil.fillBeanWithMap(value, new VoucherOrder(), true);
+//                    3.如果成功说明可以下单
+                    handleVoucherOrder(voucherOrder);
+                    //4.ACK确认 XACK stream.order g1 id
+                    stringRedisTemplate.opsForStream().acknowledge(queueName, "g1", record.getId());
+
+                } catch (Exception e) {
+                    //一个订单处理失败，不能让整个消费者线程停止
+                    LOGGER.error("处理pending-list异常", e);
+                    try {
+                        Thread.sleep(20);
+                    } catch (InterruptedException ex) {
+                        throw new RuntimeException(ex);
+                    }
                 }
             }
         }
     }
 
+    // ==================== V6 消费订单并调用事务方法（当前使用） ====================
     //异步线程处理订单
     private void handleVoucherOrder(VoucherOrder voucherOrder) {
 //        一人一单
@@ -132,36 +194,21 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
     }
 
-    // ==================== V5 Lua + 阻塞队列异步下单（当前使用） ====================
-    // 优化了什么：库存判断和一人一单在Redis中一次完成，请求线程不再直接操作数据库
-    // 当前限制：阻塞队列在JVM内存中，服务宕机时还没消费的订单可能丢失，后面可升级Redis Stream
+    // ==================== V6 Lua + Redis Stream异步下单（当前使用） ====================
+    // 升级了什么：V5的Lua负责资格判断和预扣库存，V6在同一个Lua脚本中继续把订单写入stream.order
+    // 优化效果：资格判断、Redis预扣库存、记录下单用户、写入Stream一次原子完成
     @Override
     public Result seckillVoucher(Long voucherId) {
-//        ==================== V1 直接查询数据库（已停用） ====================
-//        停用原因：秒杀请求会直接访问数据库，高并发时数据库压力大
-////        查询优惠券
-//        SeckillVoucher voucher = seckillVoucherService.getById(voucherId);
-////        判断秒杀是否结束
-//        if (voucher.getBeginTime().isAfter(LocalDateTime.now())) {
-//            return Result.fail("秒杀尚未开始");
-//        }
-////        判断秒杀是否已经结束
-//        if (voucher.getEndTime().isBefore(LocalDateTime.now())){
-//            return Result.fail("秒杀已经结束");
-//        }
-////        判断优惠券库存是否充足
-//        if (voucher.getStock() < 1) {
-//            return Result.fail("库存不足");
-//        }
-
 //        用lua脚本判断
         Long userId = UserHolder.getUser().getId();
+        long orderId = redisIdWorker.nextId("order");
 //        1.执行lua脚本
         Long result = stringRedisTemplate.execute(
                 SECKILL_SCRIPT,
                 Collections.emptyList(),
                 voucherId.toString(),
-                userId.toString()
+                userId.toString(),
+                String.valueOf(orderId)
         );
 
         //【必要修正】Redis异常时result可能为null，不能直接调用intValue()
@@ -174,34 +221,18 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         if (r!=0){
             //        2.1不为0代表没有购买资格
             return Result.fail(r == 1 ? "库存不足" : "不能重复下单");
-
         }
-//        2.2.为0 有购买资格 把下单信息保存到阻塞队列里
-        long orderId = redisIdWorker.nextId("order");
 
-//        创建订单对象
-        VoucherOrder voucherOrder = new VoucherOrder();
-//        订单id
-        voucherOrder.setId(orderId);
-//        用户id
-        voucherOrder.setUserId(userId);
-//        代金券id
-        voucherOrder.setVoucherId(voucherId);
-
-//        获取代理对象（事务）
-        //【必要调整】必须在请求线程中获取代理对象，异步线程中不能使用AopContext.currentProxy()
+//        3.获取代理对象
         proxy =(IVoucherOrderService)AopContext.currentProxy();
 
-//          保存到阻塞队列，当前请求线程是生产者
-        orderTasks.add(voucherOrder);
-
-//        3.返回订单ID
-        //这里只代表订单任务已经进入队列，数据库订单由消费者线程异步创建
+//        4.返回订单ID
+        //这里只代表订单任务已经进入Redis Stream，数据库订单由消费者线程异步创建
         return Result.ok(orderId);
     }
 
-    // ==================== V5 异步创建数据库订单（当前使用） ====================
-    //【必要调整】异步线程中无法使用UserHolder，所以用户id、优惠券id和订单id都从voucherOrder获取
+    // ==================== V6 异步创建数据库订单（当前使用） ====================
+    // V5和V6都使用这个事务方法：异步线程无法使用UserHolder，所以三个id都从voucherOrder获取
     @Override
     @Transactional
     public void createVoucherOrder(VoucherOrder voucherOrder) {
@@ -232,11 +263,106 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
 
 //        保存订单
-        //订单对象已经在请求线程中设置好了订单id、用户id和代金券id
+        //订单id、用户id和代金券id已经保存在Stream消息中，消费者读取消息后封装成voucherOrder
         save(voucherOrder);
     }
 
+    // ==================== V5 Lua + JVM阻塞队列异步下单（已停用） ====================
+    // 升级了什么：库存判断和一人一单在Redis中一次完成，请求线程不再直接操作数据库
+    // 为什么停用：阻塞队列在JVM内存中，服务宕机时还没消费的订单会丢失，因此V6升级为Redis Stream
+    // 同一批V5代码统一保留在这里，方便和V6对照
+
+//    //请求线程是生产者，把订单放入队列
+//    //独立线程是消费者，从队列取出订单并保存到数据库
+//    private final BlockingQueue<VoucherOrder> orderTasks = new ArrayBlockingQueue<>(1024 * 1024);
+
+//    //阻塞队列的消费者
+//    private class VoucherOrderHandler implements Runnable {
+//        @Override
+//        public void run() {
+//            while (true) {
+//                try {
+//                    //1.获取队列中的订单信息
+//                    //队列中没有订单时，take()会阻塞等待，不会一直空转
+//                    VoucherOrder voucherOrder = orderTasks.take();
+//                    //2.创建订单
+//                    handleVoucherOrder(voucherOrder);
+//                } catch (Exception e) {
+//                    //一个订单处理失败，不能让整个消费者线程停止
+//                    LOGGER.error("处理订单异常", e);
+//                }
+//            }
+//        }
+//    }
+
+//    @Override
+//    public Result seckillVoucher(Long voucherId) {
+////        用lua脚本判断
+//        Long userId = UserHolder.getUser().getId();
+////        1.执行lua脚本
+//        Long result = stringRedisTemplate.execute(
+//                SECKILL_SCRIPT,
+//                Collections.emptyList(),
+//                voucherId.toString(),
+//                userId.toString()
+//        );
+//
+//        //【必要修正】Redis异常时result可能为null，不能直接调用intValue()
+//        if (result == null) {
+//            return Result.fail("系统繁忙，请稍后重试");
+//        }
+//
+////        2.判断结果为0
+//        int r = result.intValue();
+//        if (r!=0){
+//            //        2.1不为0代表没有购买资格
+//            return Result.fail(r == 1 ? "库存不足" : "不能重复下单");
+//        }
+////        2.2.为0 有购买资格 把下单信息保存到阻塞队列里
+//        long orderId = redisIdWorker.nextId("order");
+//
+////        创建订单对象
+//        VoucherOrder voucherOrder = new VoucherOrder();
+////        订单id
+//        voucherOrder.setId(orderId);
+////        用户id
+//        voucherOrder.setUserId(userId);
+////        代金券id
+//        voucherOrder.setVoucherId(voucherId);
+//
+////        获取代理对象（事务）
+//        //V5必须在请求线程中获取代理对象，异步线程中不能使用AopContext.currentProxy()
+//        proxy =(IVoucherOrderService)AopContext.currentProxy();
+//
+////          保存到阻塞队列，当前请求线程是生产者
+//        orderTasks.add(voucherOrder);
+//
+////        3.返回订单ID
+//        //这里只代表订单任务已经进入队列，数据库订单由消费者线程异步创建
+//        return Result.ok(orderId);
+//    }
+
     /*
+     * ==================== V1 直接查询数据库版（已停用） ====================
+     * 实现了什么：直接查询优惠券时间和库存，再同步创建数据库订单
+     * 为什么停用：秒杀请求直接访问数据库，高并发时数据库压力大
+     *
+     * //查询优惠券
+     * SeckillVoucher voucher = seckillVoucherService.getById(voucherId);
+     * //判断秒杀是否开始
+     * if (voucher.getBeginTime().isAfter(LocalDateTime.now())) {
+     *     return Result.fail("秒杀尚未开始");
+     * }
+     * //判断秒杀是否已经结束
+     * if (voucher.getEndTime().isBefore(LocalDateTime.now())){
+     *     return Result.fail("秒杀已经结束");
+     * }
+     * //判断优惠券库存是否充足
+     * if (voucher.getStock() < 1) {
+     *     return Result.fail("库存不足");
+     * }
+     *
+     * ========================================================================
      * ==================== V2 synchronized版（已停用） ====================
      * 升级了什么：同一个用户的请求串行执行，解决单机环境下的一人一单并发问题
      * 为什么停用：只能锁住当前这一台Java服务，多台服务之间无法互相感知
