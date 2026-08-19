@@ -11,6 +11,8 @@ import com.hmdp.entity.User;
 import com.hmdp.mapper.UserMapper;
 import com.hmdp.service.IUserService;
 import com.hmdp.utils.RegexUtils;
+import com.hmdp.utils.UserHolder;
+import org.springframework.data.redis.connection.BitFieldSubCommands;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
 import org.springframework.stereotype.Service;
@@ -18,9 +20,9 @@ import org.springframework.stereotype.Service;
 import javax.annotation.Resource;
 import javax.servlet.http.HttpSession;
 
-import java.util.HashMap;
-import java.util.Map;
-import java.util.UUID;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
 import java.util.concurrent.TimeUnit;
 import static com.hmdp.utils.RedisConstants.*;
 import static com.hmdp.utils.SystemConstants.USER_NICK_NAME_PREFIX;
@@ -111,6 +113,92 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
 
         //token返回客户端
         return Result.ok(token);
+    }
+
+    // ==================== 签到功能：Redis Bitmap（当前使用） ====================
+    // Key格式：sign:用户id:年月，例如sign:1:202608
+    // Bitmap中的offset从0开始，因此每月1日对应offset 0，19日对应offset 18
+    // 一个用户每个月使用一个独立的Bitmap保存签到记录
+    @Override
+    public Result sign() {
+        // 1. 获取当前登录用户
+        Long userId = UserHolder.getUser().getId();
+
+        // 2. 获取当前日期
+        LocalDateTime now = LocalDateTime.now();
+
+        // 3. 拼接当前月份的签到Key
+        // format前面带有冒号，例如:202608，最终Key为sign:1:202608
+        String format = now.format(DateTimeFormatter.ofPattern(":yyyyMM"));
+        String key = USER_SIGN_KEY + userId + format;
+
+        // 4. 获取今天是本月第几天
+        int dayOfMonth = now.getDayOfMonth();
+
+        // 5. 写入Redis Bitmap：SETBIT key offset 1
+        // Redis的offset从0开始，所以今天对应的offset需要使用dayOfMonth - 1
+        // 重复签到只是把同一个bit再次设置为1，不会产生重复数据
+        stringRedisTemplate.opsForValue().setBit(key, dayOfMonth - 1, true);
+        return Result.ok();
+    }
+
+    // ==================== 连续签到统计：从今天向前统计（当前使用） ====================
+    // 思路：读取本月1日到今天的签到记录，再从代表今天的最低位开始逐位判断
+    // 遇到1说明当天已签到，计数器加1；遇到第一个0说明连续签到中断，结束统计
+    @Override
+    public Result signCount() {
+        // 1. 获取当前登录用户
+        Long userId = UserHolder.getUser().getId();
+
+        // 2. 获取当前日期
+        LocalDateTime now = LocalDateTime.now();
+
+        // 3. 拼接当前月份的签到Key
+        String format = now.format(DateTimeFormatter.ofPattern(":yyyyMM"));
+        String key = USER_SIGN_KEY + userId + format;
+
+        // 4. 获取今天是本月第几天
+        int dayOfMonth = now.getDayOfMonth();
+
+        // 5. 获取本月1日到今天的所有签到记录
+        // BITFIELD key GET u{dayOfMonth} 0：
+        // 从offset 0开始读取dayOfMonth个无符号bit，并把二进制结果转换成十进制Long返回
+        // 例如今天是19日，就读取u19；返回结果放在List的第一个位置
+        List<Long> result = stringRedisTemplate.opsForValue().bitField(
+                key, BitFieldSubCommands.create()
+                        .get(BitFieldSubCommands.BitFieldType.unsigned(dayOfMonth))
+                        .valueAt(0)
+        );
+
+        // 6. 本月没有任何签到记录，连续签到天数为0
+        if (result == null || result.isEmpty()) {
+            return Result.ok(0);
+        }
+        Long num = result.get(0);
+        if (num == null || num == 0) {
+            return Result.ok(0);
+        }
+
+        // 7. 从二进制数字的最低位开始，向前统计连续签到天数
+        // BITFIELD读取后，最低位代表今天，右边第二位代表昨天，依次向前
+        int count = 0;
+        while (true) {
+            // num与1进行与运算，只保留num的最后一个bit位
+            if ((num & 1) == 0) {
+                // 最后一位为0，说明这一天未签到，连续签到在这里中断
+                break;
+            } else {
+                // 最后一位为1，说明这一天已签到，连续签到天数加1
+                count++;
+            }
+
+            // 数字无符号右移一位，抛弃刚刚判断过的最后一个bit位
+            // 下一次循环就可以继续判断前一天是否签到
+            num >>>= 1;
+        }
+
+        // 8. 返回从今天开始向前连续签到的天数
+        return Result.ok(count);
     }
 
     private User createUsercWithPhone(String phone) {

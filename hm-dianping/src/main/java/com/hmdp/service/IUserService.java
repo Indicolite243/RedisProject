@@ -20,4 +20,10 @@ public interface IUserService extends IService<User> {
     Result sendCode(String phone, HttpSession session);
 
     Result login(LoginFormDTO loginForm, HttpSession session);
+
+    // 当前登录用户完成今日签到
+    Result sign();
+
+    // 查询当前登录用户的连续签到天数
+    Result signCount();
 }

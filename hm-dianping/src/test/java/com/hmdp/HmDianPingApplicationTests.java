@@ -13,6 +13,7 @@ import com.hmdp.utils.RedisConstants;
 import com.hmdp.utils.RedisIdWorker;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.data.geo.Point;
 import org.springframework.data.redis.core.StringRedisTemplate;
 
 import javax.annotation.Resource;
@@ -28,7 +29,9 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
+import static com.hmdp.utils.RedisConstants.SHOP_GEO_KEY;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 @SpringBootTest
@@ -125,6 +128,29 @@ class HmDianPingApplicationTests {
         Files.write(csvPath, csvLines, StandardCharsets.UTF_8);
 
         System.out.println("Generated " + csvLines.size() + " tokens: " + csvPath);
+    }
+
+    @Test
+    void loadShopDate(){
+        //查询所有店铺信息
+        List<Shop> list = shopService.list();
+        //把店铺分组，按照type_id分组，分批完成写入
+        Map<Long, List<Shop>> map = list.stream().collect(Collectors.groupingBy(shop -> shop.getTypeId()));
+
+        //分批写入Redis
+        for(Map.Entry<Long, List<Shop>> entry:map.entrySet()){
+            //获取类型id
+            Long typeId = entry.getKey();
+            String key = SHOP_GEO_KEY + typeId;
+            List<Shop> value = entry.getValue();
+
+            //写入Redis GEOSADD key longitude latitude member
+            for (Shop shop : value) {
+                stringRedisTemplate.opsForGeo()
+                        .add(key, new Point(shop.getX(), shop.getY()), shop.getId().toString());
+            }
+        }
+
     }
 
 
