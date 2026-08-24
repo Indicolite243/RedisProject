@@ -8,6 +8,9 @@
 local voucherId = ARGV[1]
 local userId = ARGV[2]
 local id = ARGV[3]
+-- ARGV[4]：请求受理时间戳（毫秒）
+local createdAt = ARGV[4]
+
 
 -- Redis 数据 Key：
 -- String：seckill:stock:{voucherId}，保存秒杀库存
@@ -33,7 +36,16 @@ redis.call('incrby', stockKey, -1)
 redis.call('sadd', orderKey, userId)
 
 -- 5. 发送消息给队列
-redis.call('xadd','stream.order','*','userId',userId,'voucherId',voucherId,'id',id)
+redis.call(
+        'xadd',
+        'stream.order',
+        --表示让 Redis 自动生成消息 ID
+        '*',
+        'userId', userId,
+        'voucherId', voucherId,
+        'id', id,
+        'createdAt', createdAt
+)
 
 -- 0：抢购资格校验成功
 return 0

@@ -1,0 +1,15 @@
+# IDE files
+.idea/
+*.iml
+
+# Build and JVM diagnostics
+**/target/
+*.hprof
+
+# JMeter output
+**/jmeter.log
+hm-dianping/temp/
+
+# Local generated artifacts
+output/
+tmp/

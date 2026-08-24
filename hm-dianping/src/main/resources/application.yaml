@@ -1,6 +1,43 @@
 server:
   port: 8081
+hmdp:
+  seckill:
+    # 关闭旧的Stream直连MySQL消费者
+    stream-direct-consumer-enabled: false
+    # 第二阶段Redis预占模式开关
+    reservation-enabled: true
+  mq:
+    # 关闭旧的Stream直连MySQL消费者
+    stream-relay-enabled: false
+    stream-relay-consumer-name: ${HMDP_RELAY_CONSUMER_NAME:relay-1}
+    listener-enabled: true
 spring:
+  rabbitmq:
+    host: 192.168.100.128
+    port: 5672
+    virtual-host: /hmdp
+    username: hmdp
+    password: 123
+
+    # 第一阶段 Relay 只有收到 Confirm 后才能确认 Stream 消息
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      mandatory: true
+
+    listener:
+      simple:
+        acknowledge-mode: auto
+        prefetch: 10
+        concurrency: 4
+        max-concurrency: 8
+        retry:
+          enabled: true
+          initial-interval: 1000ms
+          multiplier: 2
+          max-interval: 5000ms
+          max-attempts: 3
+        default-requeue-rejected: false
   application:
     name: hmdp
   datasource:
@@ -14,9 +51,9 @@ spring:
     password: 123321
     lettuce:
       pool:
-        max-active: 10
-        max-idle: 10
-        min-idle: 1
+        max-active: 30
+        max-idle: 20
+        min-idle: 5
         time-between-eviction-runs: 10s
   jackson:
     default-property-inclusion: non_null # JSON处理时忽略非空字段
@@ -24,4 +61,4 @@ mybatis-plus:
   type-aliases-package: com.hmdp.entity # 别名扫描包
 logging:
   level:
-    com.hmdp: debug
+    com.hmdp: info

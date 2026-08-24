@@ -2,9 +2,12 @@ package com.hmdp.service.impl;
 
 import cn.hutool.core.bean.BeanUtil;
 import com.hmdp.dto.Result;
+import com.hmdp.dto.SeckillOrderStatusDTO;
+import com.hmdp.entity.SeckillReservation;
 import com.hmdp.entity.SeckillVoucher;
 import com.hmdp.entity.VoucherOrder;
 import com.hmdp.mapper.VoucherOrderMapper;
+import com.hmdp.mq.repository.SeckillReservationRepository;
 import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
@@ -35,7 +38,7 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-
+import org.springframework.beans.factory.annotation.Value;
 /**
  * <p>
  *  服务实现类
@@ -62,12 +65,31 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     @Resource
     private RedissonClient redissonClient;
 
-    private static final DefaultRedisScript<Long> SECKILL_SCRIPT;
+    @Resource
+    private SeckillReservationRepository reservationRepository;
 
+    // 是否使用Redis Stream开关 可在yml中配置
+    @Value("${hmdp.seckill.stream-direct-consumer-enabled:true}")
+    private boolean streamDirectConsumerEnabled;
+
+    // 是否启用第二阶段Redis预占模式
+    @Value("${hmdp.seckill.reservation-enabled:false}")
+    private boolean reservationEnabled;
+
+    private static final DefaultRedisScript<Long> SECKILL_SCRIPT;
+    // 第二阶段预占脚本，目前只加载，不执行
+    private static final DefaultRedisScript<Long> SECKILL_RESERVE_V2_SCRIPT;
     static {
         SECKILL_SCRIPT = new DefaultRedisScript<>();
         SECKILL_SCRIPT.setLocation(new ClassPathResource("seckill.lua"));
         SECKILL_SCRIPT.setResultType(Long.class);
+
+        // 第二阶段Redis预占脚本
+        SECKILL_RESERVE_V2_SCRIPT = new DefaultRedisScript<>();
+        SECKILL_RESERVE_V2_SCRIPT.setLocation(
+                new ClassPathResource("seckill_reserve_v2.lua")
+        );
+        SECKILL_RESERVE_V2_SCRIPT.setResultType(Long.class);
     }
 
     // ==================== 秒杀下单版本说明 ====================
@@ -96,6 +118,10 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     //Spring初始化完成以后，启动消费者线程
     @PostConstruct
     private void init() {
+        if (!streamDirectConsumerEnabled) {
+        LOGGER.info("Redis Stream 直连 MySQL 消费者已关闭");
+        return;
+        }
         SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandler());
     }
 
@@ -202,14 +228,34 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 //        用lua脚本判断
         Long userId = UserHolder.getUser().getId();
         long orderId = redisIdWorker.nextId("order");
+        long createdAt = System.currentTimeMillis();//订单创建时间
+
+        String messageId = "seckill-order-" + orderId;
+
 //        1.执行lua脚本
-        Long result = stringRedisTemplate.execute(
-                SECKILL_SCRIPT,
-                Collections.emptyList(),
-                voucherId.toString(),
-                userId.toString(),
-                String.valueOf(orderId)
-        );
+        Long result;
+        if (reservationEnabled) {
+            // 第二阶段：写入Redis预占记录和待发送ZSet
+            result = stringRedisTemplate.execute(
+                    SECKILL_RESERVE_V2_SCRIPT,
+                    Collections.emptyList(),
+                    voucherId.toString(),
+                    userId.toString(),
+                    String.valueOf(orderId),
+                    messageId,
+                    String.valueOf(createdAt)
+            );
+        } else {
+            // 第一阶段：继续写入Redis Stream
+            result = stringRedisTemplate.execute(
+                    SECKILL_SCRIPT,
+                    Collections.emptyList(),
+                    voucherId.toString(),
+                    userId.toString(),
+                    String.valueOf(orderId),
+                    String.valueOf(createdAt)
+            );
+        }
 
         //【必要修正】Redis异常时result可能为null，不能直接调用intValue()
         if (result == null) {
@@ -229,6 +275,80 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 //        4.返回订单ID
         //这里只代表订单任务已经进入Redis Stream，数据库订单由消费者线程异步创建
         return Result.ok(orderId);
+    }
+
+    /**
+     * 查询秒杀订单的异步处理状态。
+     *
+     * 查询顺序必须是MySQL在前、Redis在后：MySQL订单是最终业务事实，
+     * 即使消费者已经成功落库但Redis状态还没来得及更新，也应该返回成功。
+     */
+    @Override
+    public Result querySeckillOrderStatus(Long orderId, Long currentUserId) {
+        if (orderId == null || currentUserId == null) {
+            return Result.fail("订单参数错误");
+        }
+
+        // 同时使用订单ID和当前用户ID查询，避免用户通过猜测orderId查看别人的订单。
+        VoucherOrder databaseOrder = query()
+                .eq("id", orderId)
+                .eq("user_id", currentUserId)
+                .one();
+
+        if (databaseOrder != null) {
+            // 数据库已经存在订单就说明业务成功；顺便修正可能滞后的Redis技术状态。
+            reservationRepository.markCreated(orderId);
+            return statusResult(orderId, "SUCCESS", "订单创建成功");
+        }
+
+        // MySQL还没有订单时，再查看Redis中的异步处理进度。
+        SeckillReservation reservation = reservationRepository.findByOrderId(orderId);
+        if (reservation == null) {
+            return Result.fail("订单不存在或处理记录已失效");
+        }
+
+        // Reservation中也要校验用户归属，不能仅凭orderId返回技术状态。
+        if (reservation.getUserId() == null
+                || !currentUserId.equals(reservation.getUserId())) {
+            return Result.fail("无权查询该订单");
+        }
+
+        String status = reservation.getStatus();
+
+        // 下面四种状态都表示消息仍在正常投递或等待RabbitMQ消费者处理。
+        if (SeckillReservation.STATUS_PREPARED.equals(status)
+                || SeckillReservation.STATUS_PUBLISHING.equals(status)
+                || SeckillReservation.STATUS_PUBLISH_RETRY.equals(status)
+                || SeckillReservation.STATUS_PUBLISHED.equals(status)) {
+            return statusResult(orderId, "PROCESSING", "订单正在处理中");
+        }
+
+        if (SeckillReservation.STATUS_CREATED.equals(status)) {
+            return statusResult(orderId, "SUCCESS", "订单创建成功");
+        }
+
+        if (SeckillReservation.STATUS_DEAD.equals(status)) {
+            return statusResult(orderId, "FAILED", "订单处理失败，等待人工处理");
+        }
+
+        // 补偿尚未结束时不能提示用户重新抢购，因此仍然返回处理中。
+        if (SeckillReservation.STATUS_COMPENSATING.equals(status)) {
+            return statusResult(orderId, "PROCESSING", "订单正在进行库存补偿");
+        }
+
+        if (SeckillReservation.STATUS_COMPENSATED.equals(status)) {
+            return statusResult(orderId, "COMPENSATED", "订单已补偿，可以重新抢购");
+        }
+
+        LOGGER.error("发现未知的秒杀订单技术状态，orderId={}, status={}", orderId, status);
+        return Result.fail("订单状态异常，请稍后重试");
+    }
+
+    /**
+     * 统一构造状态查询成功结果，避免每个状态都重复创建DTO。
+     */
+    private Result statusResult(Long orderId, String status, String message) {
+        return Result.ok(new SeckillOrderStatusDTO(orderId, status, message));
     }
 
     // ==================== V6 异步创建数据库订单（当前使用） ====================

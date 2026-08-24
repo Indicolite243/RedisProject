@@ -34,7 +34,13 @@ import java.util.stream.Collectors;
 import static com.hmdp.utils.RedisConstants.SHOP_GEO_KEY;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
-@SpringBootTest
+@SpringBootTest(properties = {
+        // 通用测试不验证异步消息链路，关闭后台消费者，避免抢走其他集成测试的消息。
+        "hmdp.seckill.stream-direct-consumer-enabled=false",
+        "hmdp.seckill.reservation-enabled=false",
+        "hmdp.mq.stream-relay-enabled=false",
+        "hmdp.mq.listener-enabled=false"
+})
 class HmDianPingApplicationTests {
     @Resource
     private CacheClient cacheClient;
@@ -150,8 +156,24 @@ class HmDianPingApplicationTests {
                         .add(key, new Point(shop.getX(), shop.getY()), shop.getId().toString());
             }
         }
+    }
+    @Test
+    void testHyperloglog(){
+        String[] values=new String[1000];
+        int j=0;
+        for (int i = 0; i < 1000000; i++) {
+            j=i%1000;
+            values[j]="user_"+i;
+            if (j==999){
+                stringRedisTemplate.opsForHyperLogLog().add("hil",values);
+            }
+        }
+        Long cont = stringRedisTemplate.opsForHyperLogLog().size("hil");
+        System.out.println("cont = " + cont);
 
     }
+
+
 
 
 }

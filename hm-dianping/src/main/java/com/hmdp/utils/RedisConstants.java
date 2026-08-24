@@ -21,6 +21,16 @@ public class RedisConstants {
     public static final String FOLLOWS_KEY = "follows:";
 
     public static final String SECKILL_STOCK_KEY = "seckill:stock:";
+    // 用户购买资格：Hash，field是userId，value是orderId
+    public static final String SECKILL_ORDER_MAP_KEY = "seckill:order-map:";
+
+    // 单笔订单的预占记录：Hash，后面拼接orderId
+    public static final String SECKILL_RESERVATION_KEY = "seckill:reservation:";
+
+    // 等待发送到RabbitMQ的订单：ZSet
+    public static final String SECKILL_PUBLISH_PENDING_KEY = "seckill:publish:pending";
+
+
     public static final String BLOG_LIKED_KEY = "blog:liked:";
 
     //V4推模式Feed收件箱使用ZSet保存，key为feed:用户id，member为博客id，score为发布时间戳
