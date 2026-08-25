@@ -68,23 +68,33 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     @Resource
     private SeckillReservationRepository reservationRepository;
 
-    // 是否使用Redis Stream开关 可在yml中配置
+    /**
+     * 旧版 Stream 直连 MySQL 消费者开关。
+     * RabbitMQ 链路启用时必须关闭，否则 Stream 消费者与 RabbitMQ Listener
+     * 可能同时处理订单，给切换和故障排查带来干扰。
+     */
     @Value("${hmdp.seckill.stream-direct-consumer-enabled:true}")
     private boolean streamDirectConsumerEnabled;
 
-    // 是否启用第二阶段Redis预占模式
+    /**
+     * 秒杀入口模式开关。
+     * true：使用 Reservation Hash + Pending ZSet，随后由 Dispatcher 发布 RabbitMQ；
+     * false：使用旧版 seckill.lua，把订单写入 Redis Stream。
+     */
     @Value("${hmdp.seckill.reservation-enabled:false}")
     private boolean reservationEnabled;
 
+    /** 旧版 Redis Stream 秒杀脚本，保留用于链路切换和性能对照。 */
     private static final DefaultRedisScript<Long> SECKILL_SCRIPT;
-    // 第二阶段预占脚本，目前只加载，不执行
+
+    /** 当前 RabbitMQ 链路使用的 Redis 预占脚本。 */
     private static final DefaultRedisScript<Long> SECKILL_RESERVE_V2_SCRIPT;
     static {
         SECKILL_SCRIPT = new DefaultRedisScript<>();
         SECKILL_SCRIPT.setLocation(new ClassPathResource("seckill.lua"));
         SECKILL_SCRIPT.setResultType(Long.class);
 
-        // 第二阶段Redis预占脚本
+        // 预占脚本会原子完成资格判断、库存预扣、Reservation 写入和 Pending 入队。
         SECKILL_RESERVE_V2_SCRIPT = new DefaultRedisScript<>();
         SECKILL_RESERVE_V2_SCRIPT.setLocation(
                 new ClassPathResource("seckill_reserve_v2.lua")
@@ -98,24 +108,24 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     // V3：使用SimpleRedisLock解决集群环境的一人一单
     // V4：使用Redisson替代自己实现的分布式锁
     // V5：使用Lua脚本判断秒杀资格，再放入JVM阻塞队列异步下单（已停用）
-    // V6：使用Lua脚本判断资格并写入Redis Stream，消费者组异步下单【当前使用】
-    // 整理时间：2026-08-18，只整理顺序和版本标记，尽量保留原来的代码和注释
+    // V6：使用Lua脚本判断资格并写入Redis Stream，消费者组异步下单（兼容保留）
+    // V7：使用Redis预占记录保存可靠状态，由Dispatcher发布RabbitMQ，Listener异步落库【当前使用】
     // ========================================================
 
-    // ==================== V6 Redis Stream异步消费者（当前使用） ====================
+    // ==================== V6 Redis Stream异步消费者（兼容保留） ====================
     // 升级了什么：用Redis Stream替代V5的JVM阻塞队列，消息可以跨服务重启保留
     // 请求线程是生产者：Lua判断资格、预扣Redis库存并把订单消息写入stream.order
     // 独立线程是消费者：从stream.order读取订单，再保存到数据库
     // V6主流程：seckillVoucher -> seckill.lua写入Stream -> VoucherOrderHandler
     //          -> handleVoucherOrder加锁 -> createVoucherOrder事务下单 -> XACK确认
 
-    //创建单线程线程池
+    // 仅供旧 Stream 直连消费者使用；关闭开关后不会向该线程池提交任务。
     private static final ExecutorService SECKILL_ORDER_EXECUTOR = Executors.newSingleThreadExecutor();
 
     //保存当前类的代理对象，异步线程通过代理对象调用事务方法
     private IVoucherOrderService proxy;
 
-    //Spring初始化完成以后，启动消费者线程
+    /** Spring 初始化完成后，根据开关决定是否启动旧 Stream 消费者。 */
     @PostConstruct
     private void init() {
         if (!streamDirectConsumerEnabled) {
@@ -125,7 +135,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandler());
     }
 
-    //Redis Stream的消费者
+    /** 旧版 Redis Stream 消费者，不参与当前 RabbitMQ 主链路。 */
     private class VoucherOrderHandler implements Runnable {
         @Override
         public void run() {
@@ -197,7 +207,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
     }
 
-    // ==================== V6 消费订单并调用事务方法（当前使用） ====================
+    // ==================== V6 消费订单并调用事务方法（兼容保留） ====================
     //异步线程处理订单
     private void handleVoucherOrder(VoucherOrder voucherOrder) {
 //        一人一单
@@ -220,33 +230,33 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
     }
 
-    // ==================== V6 Lua + Redis Stream异步下单（当前使用） ====================
-    // 升级了什么：V5的Lua负责资格判断和预扣库存，V6在同一个Lua脚本中继续把订单写入stream.order
-    // 优化效果：资格判断、Redis预扣库存、记录下单用户、写入Stream一次原子完成
+    // ==================== 秒杀请求入口：按配置选择 V6 或 V7 ====================
+    // 两种模式都会在请求线程中通过 Lua 原子完成资格判断和 Redis 库存预扣。
+    // V6 后续载体是 Redis Stream；V7 后续载体是 Reservation + Pending ZSet + RabbitMQ。
     @Override
     public Result seckillVoucher(Long voucherId) {
-//        用lua脚本判断
+        // 请求线程只负责生成订单标识并执行 Redis Lua，不同步等待 MySQL 创建订单。
         Long userId = UserHolder.getUser().getId();
         long orderId = redisIdWorker.nextId("order");
-        long createdAt = System.currentTimeMillis();//订单创建时间
+        long createdAt = System.currentTimeMillis();// 请求被受理的时间，同时作为首次待发送时间
 
         String messageId = "seckill-order-" + orderId;
 
-//        1.执行lua脚本
+        // 根据开关选择新旧链路。两份脚本都用 0/1/2 表示成功/库存不足/重复下单。
         Long result;
         if (reservationEnabled) {
-            // 第二阶段：写入Redis预占记录和待发送ZSet
+            // V7 当前链路：保存可恢复的预占状态，并让 Dispatcher 异步发布到 RabbitMQ。
             result = stringRedisTemplate.execute(
-                    SECKILL_RESERVE_V2_SCRIPT,
-                    Collections.emptyList(),
-                    voucherId.toString(),
-                    userId.toString(),
-                    String.valueOf(orderId),
-                    messageId,
-                    String.valueOf(createdAt)
+                    SECKILL_RESERVE_V2_SCRIPT,//RedisScript 对象
+                    Collections.emptyList(),//keys 集合
+                    voucherId.toString(),// ARGV[1]
+                    userId.toString(),// ARGV[2]
+                    String.valueOf(orderId),// ARGV[3]
+                    messageId, // ARGV[4]
+                    String.valueOf(createdAt)// ARGV[5]
             );
         } else {
-            // 第一阶段：继续写入Redis Stream
+            // V6 兼容链路：把订单事件写入 Redis Stream。
             result = stringRedisTemplate.execute(
                     SECKILL_SCRIPT,
                     Collections.emptyList(),
@@ -257,7 +267,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             );
         }
 
-        //【必要修正】Redis异常时result可能为null，不能直接调用intValue()
+        // Redis 执行异常时 result 可能为 null，不能直接调用 intValue()。
         if (result == null) {
             return Result.fail("系统繁忙，请稍后重试");
         }
@@ -272,8 +282,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 //        3.获取代理对象
         proxy =(IVoucherOrderService)AopContext.currentProxy();
 
-//        4.返回订单ID
-        //这里只代表订单任务已经进入Redis Stream，数据库订单由消费者线程异步创建
+        // 返回订单 ID 只代表 Redis 已接受这次秒杀请求，并不代表 MySQL 订单已经创建。
+        // 前端可使用该 ID 查询异步状态；RabbitMQ Listener 成功提交事务后才算最终落库。
         return Result.ok(orderId);
     }
 

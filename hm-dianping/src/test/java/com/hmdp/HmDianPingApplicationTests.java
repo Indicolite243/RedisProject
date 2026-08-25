@@ -2,7 +2,6 @@ package com.hmdp;
 
 import cn.hutool.core.bean.BeanUtil;
 import cn.hutool.core.bean.copier.CopyOptions;
-import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.hmdp.dto.UserDTO;
 import com.hmdp.entity.Shop;
 import com.hmdp.entity.User;
@@ -32,7 +31,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import static com.hmdp.utils.RedisConstants.SHOP_GEO_KEY;
-import static org.junit.jupiter.api.Assertions.assertEquals;
 
 @SpringBootTest(properties = {
         // 通用测试不验证异步消息链路，关闭后台消费者，避免抢走其他集成测试的消息。
@@ -42,6 +40,13 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
         "hmdp.mq.listener-enabled=false"
 })
 class HmDianPingApplicationTests {
+    /**
+     * 本轮压测使用的一次性登录身份数量。
+     *
+     * <p>每个身份只在 Redis 登录态和 JMeter CSV 中存在，用于模拟不同用户请求。
+     * 不需要为了压测向 tb_user 写入大量无业务意义的测试数据。</p>
+     */
+    private static final int JMETER_TOKEN_COUNT = 10_000;
     @Resource
     private CacheClient cacheClient;
     @Resource
@@ -91,49 +96,66 @@ class HmDianPingApplicationTests {
     }
 
     /**
-     * 为 JMeter 生成 1000 个可登录用户的 Token。
+     * 为 JMeter 生成 10000 个互不重复的压测 Token。
      *
-     * <p>Redis Key 格式与正常登录保持一致：login:token:{token}。
-     * CSV 每行格式为 token,userId，可在 JMeter 的 CSV Data Set Config 中读取。</p>
+     * <p>先使用数据库中已有用户，再补充虚拟用户 ID。秒杀接口只从 Redis 登录态读取
+     * UserDTO，不需要查询 tb_user，因此虚拟身份能模拟独立用户，又不会污染业务数据。</p>
+     *
+     * <p>Redis Key 格式：login:token:{token}；CSV 每行格式：token,userId。</p>
      */
     @Test
     void generateJmeterUserTokens() throws Exception {
-        List<User> users = userService.list(
-                new QueryWrapper<User>()
-                        .orderByAsc("id")
-                        .last("LIMIT 1000")
-        );
-        assertEquals(1000, users.size(), "数据库中的用户数量不足 1000 个");
+        List<User> users = userService.list();
+        List<String> csvLines = new ArrayList<>(JMETER_TOKEN_COUNT);
+        long nextVirtualUserId = users.stream()
+                .map(User::getId)
+                .filter(java.util.Objects::nonNull)
+                .mapToLong(Long::longValue)
+                .max()
+                .orElse(0L) + 1;
 
-        List<String> csvLines = new ArrayList<>(users.size());
+        // 真实用户优先生成登录态，便于在需要时排查对应的数据库订单记录。
         for (User user : users) {
-            // 使用确定性 Token，重复执行测试不会在 Redis 中不断堆积新 Key。
-            String token = "load-test-" + user.getId();
-            String tokenKey = RedisConstants.LOGIN_USER_KEY + token;
+            if (csvLines.size() == JMETER_TOKEN_COUNT) {
+                break;
+            }
+            writeJmeterToken(BeanUtil.copyProperties(user, UserDTO.class), csvLines);
+        }
 
-            UserDTO userDTO = BeanUtil.copyProperties(user, UserDTO.class);
-            Map<String, Object> userMap = BeanUtil.beanToMap(
-                    userDTO,
-                    new HashMap<>(),
-                    CopyOptions.create()
-                            .setIgnoreNullValue(true)
-                            .setFieldValueEditor((fieldName, fieldValue) -> fieldValue.toString())
-            );
-
-            stringRedisTemplate.opsForHash().putAll(tokenKey, userMap);
-            stringRedisTemplate.expire(
-                    tokenKey,
-                    RedisConstants.LOGIN_USER_TTL,
-                    TimeUnit.MINUTES
-            );
-            csvLines.add(token + "," + user.getId());
+        // 数据库用户不足时，补齐虚拟压测身份。ID 从现有最大 ID 之后开始，避免与真实用户冲突。
+        while (csvLines.size() < JMETER_TOKEN_COUNT) {
+            UserDTO virtualUser = new UserDTO();
+            virtualUser.setId(nextVirtualUserId++);
+            virtualUser.setNickName("load-test-user-" + virtualUser.getId());
+            virtualUser.setIcon("");
+            writeJmeterToken(virtualUser, csvLines);
         }
 
         Path csvPath = Paths.get("target", "jmeter", "user-tokens.csv").toAbsolutePath();
         Files.createDirectories(csvPath.getParent());
         Files.write(csvPath, csvLines, StandardCharsets.UTF_8);
 
-        System.out.println("Generated " + csvLines.size() + " tokens: " + csvPath);
+        System.out.println("Generated " + csvLines.size() + " unique JMeter tokens: " + csvPath);
+    }
+
+    /**
+     * 将一个压测身份写入 Redis 登录态，并追加到 JMeter CSV。
+     * Token 使用 userId 派生，重复执行时覆盖同一 Redis Key，便于反复压测。
+     */
+    private void writeJmeterToken(UserDTO userDTO, List<String> csvLines) {
+        String token = "load-test-" + userDTO.getId();
+        String tokenKey = RedisConstants.LOGIN_USER_KEY + token;
+        Map<String, Object> userMap = BeanUtil.beanToMap(
+                userDTO,
+                new HashMap<>(),
+                CopyOptions.create()
+                        .setIgnoreNullValue(true)
+                        .setFieldValueEditor((fieldName, fieldValue) -> fieldValue.toString())
+        );
+
+        stringRedisTemplate.opsForHash().putAll(tokenKey, userMap);
+        stringRedisTemplate.expire(tokenKey, RedisConstants.LOGIN_USER_TTL, TimeUnit.MINUTES);
+        csvLines.add(token + "," + userDTO.getId());
     }
 
     @Test

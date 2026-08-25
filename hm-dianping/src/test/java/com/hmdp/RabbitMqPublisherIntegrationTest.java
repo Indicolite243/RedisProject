@@ -22,6 +22,21 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+/**
+ * RabbitMQ 秒杀可靠链路集成测试。
+ *
+ * <p>该测试会启动完整的 Spring Boot 测试容器，并连接真实 Redis 和 RabbitMQ，验证：</p>
+ *
+ * <ol>
+ *     <li>Publisher Confirm、消息路由和 JSON 反序列化。</li>
+ *     <li>DEAD 记录人工重新投递及状态约束。</li>
+ *     <li>库存补偿的原子性与重复补偿幂等性。</li>
+ *     <li>订单状态查询和订单归属校验。</li>
+ * </ol>
+ *
+ * <p>Redis 使用 DB15，并在每个用例结束后清理测试 Key；RabbitMQ Listener 在测试中关闭，
+ * 防止测试消息被后台消费者抢先取走。运行前必须确保 Redis 和 RabbitMQ 可连接。</p>
+ */
 @SpringBootTest(properties = {
         "hmdp.seckill.reservation-enabled=false",
         "hmdp.mq.listener-enabled=false",
@@ -49,22 +64,9 @@ public class RabbitMqPublisherIntegrationTest {
 
     @Autowired
     private StringRedisTemplate stringRedisTemplate;
+
     /**
-     * RabbitMQ 发布者集成测试。
-     *
-     * 该测试会启动完整的 Spring Boot 测试容器，
-     * 验证以下流程：
-     *
-     * 1. Spring 能否正常注入 RabbitMQ 发布器；
-     * 2. 秒杀订单消息能否成功发送到交换机；
-     * 3. RabbitMQ 是否返回 Publisher Confirm ACK；
-     * 4. 消息是否成功路由到目标队列；
-     * 5. 消费消息时能否正确反序列化为 DTO；
-     * 6. 消息中的关键字段是否保持一致。
-     *
-     * 注意：
-     * 该测试依赖真实的 Redis 和 RabbitMQ 服务，
-     * 因此运行测试前必须确保相关服务已经启动。
+     * 验证一条 DTO 能收到 Confirm ACK、正确路由到主队列并按原类型反序列化。
      */
     @Test
     void shouldPublishAndReceiveSeckillOrderMessage() throws Exception {

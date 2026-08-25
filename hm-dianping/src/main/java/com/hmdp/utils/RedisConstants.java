@@ -20,14 +20,28 @@ public class RedisConstants {
     //V2关注列表使用Set保存，key为follows:用户id，member为被关注用户id
     public static final String FOLLOWS_KEY = "follows:";
 
+    /**
+     * 秒杀库存：String，完整 Key 为 {@code seckill:stock:{voucherId}}，value 为剩余库存。
+     * 库存由秒杀 Lua 原子预扣，订单事务落库时还会独立扣减 MySQL 库存。
+     */
     public static final String SECKILL_STOCK_KEY = "seckill:stock:";
-    // 用户购买资格：Hash，field是userId，value是orderId
+
+    /**
+     * 一人一单映射：Hash，完整 Key 为 {@code seckill:order-map:{voucherId}}。
+     * field 是 userId，value 是 orderId；补偿成功后才会删除对应 field。
+     */
     public static final String SECKILL_ORDER_MAP_KEY = "seckill:order-map:";
 
-    // 单笔订单的预占记录：Hash，后面拼接orderId
+    /**
+     * 单笔订单的预占记录：Hash，完整 Key 为 {@code seckill:reservation:{orderId}}。
+     * 保存订单标识、用户、优惠券、发布次数、下次重试时间和业务状态。
+     */
     public static final String SECKILL_RESERVATION_KEY = "seckill:reservation:";
 
-    // 等待发送到RabbitMQ的订单：ZSet
+    /**
+     * RabbitMQ 待发布索引：ZSet，member 为 orderId，score 为 nextRetryAt 毫秒时间戳。
+     * Dispatcher 只扫描 score 小于等于当前时间的成员。
+     */
     public static final String SECKILL_PUBLISH_PENDING_KEY = "seckill:publish:pending";
 
 

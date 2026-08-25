@@ -2,14 +2,17 @@ server:
   port: 8081
 hmdp:
   seckill:
-    # 关闭旧的Stream直连MySQL消费者
+    # 旧链路开关：Stream -> VoucherOrderHandler -> MySQL。
+    # RabbitMQ 主链路运行时保持 false，避免两个消费者同时处理订单。
     stream-direct-consumer-enabled: false
-    # 第二阶段Redis预占模式开关
+    # 新链路入口：Lua 写 Reservation Hash 和 Pending ZSet，由 Dispatcher 发布 RabbitMQ。
     reservation-enabled: true
   mq:
-    # 关闭旧的Stream直连MySQL消费者
+    # 迁移期桥接：Stream -> Relay -> RabbitMQ。完成 V7 切换后保持关闭。
     stream-relay-enabled: false
+    # 多实例启用 Relay 时，每个实例需要使用不同且稳定的 consumer 名称。
     stream-relay-consumer-name: ${HMDP_RELAY_CONSUMER_NAME:relay-1}
+    # RabbitMQ -> Listener -> MySQL 消费链路开关。
     listener-enabled: true
 spring:
   rabbitmq:
@@ -19,24 +22,31 @@ spring:
     username: hmdp
     password: 123
 
-    # 第一阶段 Relay 只有收到 Confirm 后才能确认 Stream 消息
+    # 发布可靠性：为每条消息返回异步 Confirm，发布者据此判断 Broker 是否接收。
     publisher-confirm-type: correlated
+    # 开启 Return 回调；交换机找不到匹配队列时，消息会退回给发布者。
     publisher-returns: true
     template:
+      # 强制检查路由结果，使“无法路由”进入 Return 流程，而不是静默丢弃。
       mandatory: true
 
     listener:
       simple:
+        # Listener 正常返回才 ACK；抛异常时由容器执行重试策略。
         acknowledge-mode: auto
+        # 每个消费者最多预取10条未确认消息，限制单个消费者占用量。
         prefetch: 10
+        # 启动4个消费者，压力升高时最多扩容到8个。
         concurrency: 4
         max-concurrency: 8
         retry:
+          # 消费异常时最多尝试3次，重试间隔从1s开始按2倍增长，最大不超过5s。
           enabled: true
           initial-interval: 1000ms
           multiplier: 2
           max-interval: 5000ms
           max-attempts: 3
+        # 重试耗尽后不回主队列；消息按队列DLX参数进入死信队列，避免无限循环。
         default-requeue-rejected: false
   application:
     name: hmdp
